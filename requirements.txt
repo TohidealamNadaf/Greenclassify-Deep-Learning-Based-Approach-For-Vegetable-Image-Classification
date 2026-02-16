@@ -1,0 +1,10 @@
+flask
+torch
+torchvision
+numpy
+pillow
+opencv-python-headless
+matplotlib
+werkzeug
+pandas
+keras
