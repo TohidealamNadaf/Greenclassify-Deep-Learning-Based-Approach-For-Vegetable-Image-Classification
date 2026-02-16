@@ -12,11 +12,41 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import numpy as np
 import json
+import time
+
+class DiagnosticCallback(callbacks.Callback):
+    """
+    Custom callback for detailed logging of the training process.
+    """
+    def on_epoch_begin(self, epoch, logs=None):
+        print(f"\n[DIAGNOSTIC] Starting Epoch {epoch + 1} at {time.ctime()}")
+
+    def on_epoch_end(self, epoch, logs=None):
+        print(f"[DIAGNOSTIC] Finished Epoch {epoch + 1} at {time.ctime()}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("[DIAGNOSTIC] GPU cache cleared.")
+
+    def on_test_begin(self, logs=None):
+        print(f"[DIAGNOSTIC] Starting Validation phase at {time.ctime()}")
+
+    def on_test_end(self, logs=None):
+        print(f"[DIAGNOSTIC] Finished Validation phase at {time.ctime()}")
+
+def data_generator(dataloader):
+    """
+    Wraps a DataLoader into a persistent generator.
+    Yields (images, labels) as numpy arrays in HWC format.
+    """
+    while True:
+        for images, labels in dataloader:
+            # images: (Batch, H, W, C) numpy array
+            # labels: (Batch,) numpy array
+            yield images, labels
 
 def get_data_loaders(data_dir, batch_size=32, image_size=(224, 224)):
     """
-    Creates DataLoaders for all classes in the dataset.
-    Ensures NHWC format for Keras 3 compatibility.
+    Creates DataLoaders and wraps them in generators.
     """
     train_transforms = transforms.Compose([
         transforms.Resize(image_size),
@@ -35,6 +65,7 @@ def get_data_loaders(data_dir, batch_size=32, image_size=(224, 224)):
     ])
 
     loaders = {}
+    steps = {}
     class_names = None
     
     for split in ['train', 'validation']:
@@ -48,16 +79,19 @@ def get_data_loaders(data_dir, batch_size=32, image_size=(224, 224)):
         if split == 'train':
             class_names = dataset.classes
             
-        # We use num_workers=0 to avoid potential multiprocessing issues in some environments
-        loaders[split] = DataLoader(dataset, batch_size=batch_size, shuffle=(split == 'train'), num_workers=0)
-        print(f"Loaded {len(dataset)} images for '{split}' (Classes: {len(dataset.classes)})")
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=(split == 'train'), num_workers=0)
+        loaders[split] = data_generator(loader)
+        steps[split] = int(np.ceil(len(dataset) / batch_size))
         
-    return loaders, class_names
+        print(f"Loaded {len(dataset)} images for '{split}' ({steps[split]} steps per epoch).")
+        
+    return loaders, steps, class_names
 
 def build_resnet_model(num_classes):
     """
     Builds the ResNet50 transfer learning model.
     """
+    # Use Keras 3 ResNet50 implementation
     base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
     base_model.trainable = False
     
@@ -102,20 +136,18 @@ def plot_history(history):
 if __name__ == "__main__":
     DATA_DIR = "dataset"
     BATCH_SIZE = 32
-    EPOCHS = 20 # Increased for full training
+    # Reduced epochs for re-verification run
+    EPOCHS = 10 
     MODEL_NAME = "vegetable_resnet50_full.keras"
-    CLASS_NAMES_FILE = "class_names.json"
 
     # 1. Load Data
-    data_loaders, class_names = get_data_loaders(DATA_DIR, BATCH_SIZE)
+    data_gens, steps, class_names = get_data_loaders(DATA_DIR, BATCH_SIZE)
     if not class_names:
         print("Failed to load dataset. Exiting.")
         exit()
         
-    # Save class names for future inference
-    with open(CLASS_NAMES_FILE, 'w') as f:
+    with open("class_names.json", 'w') as f:
         json.dump(class_names, f)
-    print(f"Class names saved to {CLASS_NAMES_FILE}")
 
     # 2. Build and Compile Model
     model = build_resnet_model(len(class_names))
@@ -128,30 +160,30 @@ if __name__ == "__main__":
 
     # 3. Callbacks
     my_callbacks = [
+        DiagnosticCallback(),
         callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
         callbacks.ModelCheckpoint(filepath=MODEL_NAME, monitor='val_accuracy', save_best_only=True),
         callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=1e-6)
     ]
 
     # 4. Train
-    print("\nStarting Full Training...")
+    print("\nStarting Full Training with Diagnostic Logging...")
     try:
         history = model.fit(
-            data_loaders['train'],
-            validation_data=data_loaders['validation'],
+            data_gens['train'],
+            steps_per_epoch=steps['train'],
+            validation_data=data_gens['validation'],
+            validation_steps=steps['validation'],
             epochs=EPOCHS,
-            callbacks=my_callbacks
+            callbacks=my_callbacks,
+            verbose=1
         )
         
-        # 5. Save Final Model (Already handled by Checkpoint, but good to be explicit)
         model.save(MODEL_NAME)
         print(f"\nTraining complete. Model saved as '{MODEL_NAME}'")
-        
-        # 6. Plot History
         plot_history(history)
         
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving current state...")
-        model.save("interrupted_model.keras")
+        print("\nTraining interrupted by user.")
     except Exception as e:
         print(f"\nAn error occurred during training: {e}")
