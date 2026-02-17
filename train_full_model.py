@@ -13,6 +13,25 @@ import matplotlib.pyplot as plt
 import numpy as np
 import json
 import time
+import multiprocessing
+
+# Optimization: Check GPU availability upfront
+def check_gpu():
+    print("-" * 30)
+    print("DEVICE DIAGNOSTICS")
+    cuda_available = torch.cuda.is_available()
+    print(f"CUDA Available: {cuda_available}")
+    if cuda_available:
+        print(f"Device Name: {torch.cuda.get_device_name(0)}")
+    else:
+        print("WARNING: No GPU detected. Training will be extremely slow on CPU.")
+    print("-" * 30)
+
+def to_nhwc(x):
+    """
+    Top-level function to convert NCHW to NHWC for pickling support on Windows.
+    """
+    return x.permute(1, 2, 0)
 
 class DiagnosticCallback(callbacks.Callback):
     """
@@ -33,16 +52,7 @@ class DiagnosticCallback(callbacks.Callback):
     def on_test_end(self, logs=None):
         print(f"[DIAGNOSTIC] Finished Validation phase at {time.ctime()}")
 
-def data_generator(dataloader):
-    """
-    Wraps a DataLoader into a persistent generator.
-    Yields (images, labels) as numpy arrays in HWC format.
-    """
-    while True:
-        for images, labels in dataloader:
-            # images: (Batch, H, W, C) numpy array
-            # labels: (Batch,) numpy array
-            yield images, labels
+# Removed custom data_generator as Keras 3 fit() supports PyTorch DataLoaders directly
 
 def get_data_loaders(data_dir, batch_size=32, image_size=(224, 224)):
     """
@@ -54,14 +64,14 @@ def get_data_loaders(data_dir, batch_size=32, image_size=(224, 224)):
         transforms.RandomRotation(15),
         transforms.ToTensor(),
         # Convert NCHW to NHWC for Keras defaults
-        transforms.Lambda(lambda x: x.permute(1, 2, 0).numpy()) 
+        transforms.Lambda(to_nhwc) # Use top-level function for pickling support
     ])
     
     val_transforms = transforms.Compose([
         transforms.Resize(image_size),
         transforms.ToTensor(),
         # Convert NCHW to NHWC for Keras defaults
-        transforms.Lambda(lambda x: x.permute(1, 2, 0).numpy())
+        transforms.Lambda(to_nhwc) # Use top-level function for pickling support
     ])
 
     loaders = {}
@@ -79,11 +89,20 @@ def get_data_loaders(data_dir, batch_size=32, image_size=(224, 224)):
         if split == 'train':
             class_names = dataset.classes
             
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=(split == 'train'), num_workers=0)
-        loaders[split] = data_generator(loader)
-        steps[split] = int(np.ceil(len(dataset) / batch_size))
+        # Parallel data loading (using num_workers=2 for a balance between overhead and speed)
+        num_workers = 0
         
-        print(f"Loaded {len(dataset)} images for '{split}' ({steps[split]} steps per epoch).")
+        loader = DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=(split == 'train'), 
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available()
+        )
+        loaders[split] = loader
+        steps[split] = len(loader)
+        
+        print(f"Loaded {len(dataset)} images for '{split}' ({steps[split]} steps per epoch, num_workers={num_workers}).")
         
     return loaders, steps, class_names
 
@@ -140,8 +159,11 @@ if __name__ == "__main__":
     EPOCHS = 10 
     MODEL_NAME = "vegetable_resnet50_full.keras"
 
+    # 0. Diagnostics
+    check_gpu()
+
     # 1. Load Data
-    data_gens, steps, class_names = get_data_loaders(DATA_DIR, BATCH_SIZE)
+    data_loaders, steps, class_names = get_data_loaders(DATA_DIR, BATCH_SIZE)
     if not class_names:
         print("Failed to load dataset. Exiting.")
         exit()
@@ -170,10 +192,8 @@ if __name__ == "__main__":
     print("\nStarting Full Training with Diagnostic Logging...")
     try:
         history = model.fit(
-            data_gens['train'],
-            steps_per_epoch=steps['train'],
-            validation_data=data_gens['validation'],
-            validation_steps=steps['validation'],
+            data_loaders['train'],
+            validation_data=data_loaders['validation'],
             epochs=EPOCHS,
             callbacks=my_callbacks,
             verbose=1
